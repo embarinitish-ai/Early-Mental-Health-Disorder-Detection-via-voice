@@ -1,18 +1,14 @@
 """
-Depression Detection Pipeline v8 — WavLM + LoRA Trainer
+Depression Detection Pipeline v10 — WavLM + LoRA + Attention Pooling + Focal Loss
 
-Fine-tunes microsoft/wavlm-base-plus with LoRA (Low-Rank Adaptation)
-for binary depression classification.
-
-v8 Change:
-  - Added LoRA via PEFT library — trains only ~0.6M params instead of ~30M
-  - This is the strongest anti-overfitting measure possible:
-    small adapter matrices can't memorize training data
-  - Added gradient checkpointing (saves VRAM, allows larger batches if needed)
-  - Merged LoRA weights into final saved model for easy inference
-
-All v6/v7 fixes retained: WavLM backbone, label smoothing, instance norm,
-class weights, fast augmentation, warmup, leakage check.
+v10 Upgrades over v9:
+  1. Focal Loss (replaces weighted CE) — auto-downweights easy examples
+  2. Multi-head Attention Pooling (replaces statistical pooling)
+  3. Unfrozen top 4 encoder layers (8-11) for more capacity
+  4. Layer-wise LR decay with proper optimizer param groups
+  5. Gentler augmentation + time shift
+  6. Mixup regularization (α=0.2)
+  7. Tuned hyperparameters (cosine_with_restarts, grad clipping, etc.)
 
 Requires: pip install peft
 """
@@ -30,28 +26,37 @@ from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 from transformers import (
     WavLMForSequenceClassification,
     WavLMConfig,
-    Wav2Vec2FeatureExtractor,  # WavLM uses same feature extractor format
+    Wav2Vec2FeatureExtractor,
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback,
 )
-from peft import LoraConfig, get_peft_model, TaskType
+from transformers.modeling_outputs import SequenceClassifierOutput
+from peft import LoraConfig, get_peft_model
 from torch import nn
+import torch.nn.functional as F
 
 # ── Configuration ──────────────────────────────────────────────
 BASE_DIR = Path(r"C:\Users\embar\OneDrive\Desktop\nir")
 METADATA_CSV = BASE_DIR / "master_metadata.csv"
-OUTPUT_DIR = BASE_DIR / "wavlm_lora_v8"
+OUTPUT_DIR = BASE_DIR / "wavlm_lora_v10"
 
 MODEL_NAME = "microsoft/wavlm-base-plus"
 SR = 16_000
 MAX_LENGTH = SR * 10  # 160,000 samples (10 seconds)
 SEED = 42
 
-# LoRA Configuration
-LORA_RANK = 8           # Low rank = strong regularization
-LORA_ALPHA = 16         # Scaling factor (alpha/rank = 2x is standard)
-LORA_DROPOUT = 0.1      # Dropout on LoRA layers
+# LoRA — only on frozen lower layers (0-7)
+LORA_RANK = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.1
+
+# Layer-wise LR decay
+BASE_LR = 5e-5
+LR_DECAY_FACTOR = 0.75
+
+# Mixup
+MIXUP_ALPHA = 0.2
 
 # Reproducibility
 random.seed(SEED)
@@ -60,15 +65,144 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-
-# ── Load the WavLM feature extractor ──────────────────────────
+# ── Feature Extractor ─────────────────────────────────────────
 feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_NAME)
 
 
-# ── Dataset ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Focal Loss — focuses on hard examples, stabilizes class balance
+# ══════════════════════════════════════════════════════════════
+
+class FocalLoss(nn.Module):
+    """Focal Loss: -α(1-p)^γ log(p).
+
+    γ=2 makes the model focus on hard/misclassified examples.
+    α weights balance class frequencies.
+    """
+
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.05):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        if alpha is not None:
+            self.register_buffer("alpha", alpha)
+        else:
+            self.alpha = None
+
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(
+            logits, targets, reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+        pt = torch.exp(-ce_loss)  # probability of correct class
+        focal_weight = (1.0 - pt) ** self.gamma
+
+        if self.alpha is not None:
+            alpha_t = self.alpha.to(logits.device)[targets]
+            focal_weight = focal_weight * alpha_t
+
+        return (focal_weight * ce_loss).mean()
+
+
+# ══════════════════════════════════════════════════════════════
+# Multi-Head Attention Pooling
+# ══════════════════════════════════════════════════════════════
+
+class AttentionPooling(nn.Module):
+    """Multi-head attention pooling over temporal dimension.
+
+    Learns which time steps are most relevant for classification
+    (e.g., pauses, monotone segments, vocal tremors).
+    """
+
+    def __init__(self, hidden_size, num_heads=2):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        assert hidden_size % num_heads == 0
+
+        # Learnable query vectors (one per head)
+        self.query = nn.Parameter(torch.randn(num_heads, 1, self.head_dim) * 0.02)
+        self.key_proj = nn.Linear(hidden_size, hidden_size)
+        self.value_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, hidden_states):
+        # hidden_states: [B, T, H]
+        B, T, H = hidden_states.shape
+
+        # Project keys and values, reshape for multi-head
+        keys = self.key_proj(hidden_states).view(B, T, self.num_heads, self.head_dim)
+        values = self.value_proj(hidden_states).view(B, T, self.num_heads, self.head_dim)
+
+        # [B, num_heads, T, head_dim]
+        keys = keys.permute(0, 2, 1, 3)
+        values = values.permute(0, 2, 1, 3)
+
+        # query: [num_heads, 1, head_dim] → broadcast over batch
+        attn_weights = torch.matmul(self.query, keys.transpose(-2, -1))  # [B, num_heads, 1, T]
+        attn_weights = attn_weights / (self.head_dim ** 0.5)
+        attn_weights = F.softmax(attn_weights, dim=-1)
+
+        # Weighted sum: [B, num_heads, 1, head_dim]
+        attended = torch.matmul(attn_weights, values)
+        # [B, H]
+        attended = attended.squeeze(2).reshape(B, H)
+        attended = self.out_proj(attended)
+        attended = self.norm(attended)
+
+        return attended
+
+
+# ══════════════════════════════════════════════════════════════
+# Model: WavLM + Attention Pooling + Classifier
+# ══════════════════════════════════════════════════════════════
+
+class WavLMAttentionPool(WavLMForSequenceClassification):
+    """WavLM with multi-head attention pooling and deeper classifier."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        h = config.hidden_size  # 768
+
+        # Attention pooling (replaces default mean pooling)
+        self.attn_pool = AttentionPooling(h, num_heads=2)
+
+        # Deeper classifier: 768 → 256 → num_labels
+        self.cls_drop = nn.Dropout(0.15)
+        self.cls_proj = nn.Linear(h, 256)
+        self.cls_norm = nn.LayerNorm(256)
+        self.cls_out = nn.Linear(256, config.num_labels)
+
+    def forward(self, input_values, attention_mask=None, labels=None, **kwargs):
+        outputs = self.wavlm(input_values, attention_mask=attention_mask)
+        h = outputs.last_hidden_state  # [B, T, 768]
+
+        # Attention pooling
+        pooled = self.attn_pool(h)  # [B, 768]
+
+        # Classifier
+        x = self.cls_drop(pooled)
+        x = torch.relu(self.cls_proj(x))
+        x = self.cls_norm(x)
+        x = self.cls_drop(x)
+        logits = self.cls_out(x)  # [B, num_labels]
+
+        loss = None
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits, labels)
+
+        return SequenceClassifierOutput(loss=loss, logits=logits)
+
+
+# ══════════════════════════════════════════════════════════════
+# Dataset with Gentler Augmentation
+# ══════════════════════════════════════════════════════════════
 
 class DepressionAudioDataset(torch.utils.data.Dataset):
-    """Custom dataset with instance norm, WavLM norm, and fast augmentation."""
+    """Dataset with instance norm and gentler augmentation."""
 
     def __init__(self, dataframe: pd.DataFrame, augment: bool = False):
         self.data = dataframe.reset_index(drop=True)
@@ -82,45 +216,32 @@ class DepressionAudioDataset(torch.utils.data.Dataset):
         file_path = row["file_path"]
         label = int(row["label"])
 
-        # Load audio with torchaudio
         waveform, sample_rate = torchaudio.load(file_path)
 
-        # Resample if needed (should already be 16kHz from preprocessing)
         if sample_rate != SR:
-            resampler = torchaudio.transforms.Resample(sample_rate, SR)
-            waveform = resampler(waveform)
-
-        # Convert to mono if needed
+            waveform = torchaudio.transforms.Resample(sample_rate, SR)(waveform)
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        # Flatten to 1D numpy
         audio = waveform.squeeze(0).numpy()
 
-        # Instance Normalization: per-clip z-score
-        # Neutralizes hardware/volume differences between MODMA and DAIC-WOZ
-        clip_mean = np.mean(audio)
+        # Instance normalization (neutralizes mic hardware differences)
         clip_std = np.std(audio)
         if clip_std > 1e-8:
-            audio = (audio - clip_mean) / clip_std
+            audio = (audio - np.mean(audio)) / clip_std
 
-        # Fast augmentation (training only)
+        # Gentler augmentation (training only)
         if self.augment:
             audio = self._apply_augmentation(audio)
 
-        # Pad or truncate to fixed length
+        # Pad or truncate
         if len(audio) > MAX_LENGTH:
             audio = audio[:MAX_LENGTH]
         elif len(audio) < MAX_LENGTH:
             audio = np.pad(audio, (0, MAX_LENGTH - len(audio)), mode="constant")
 
-        # Apply WavLM feature extractor normalization
-        inputs = feature_extractor(
-            audio,
-            sampling_rate=SR,
-            return_tensors="pt",
-            padding=False,
-        )
+        # Feature extractor normalization
+        inputs = feature_extractor(audio, sampling_rate=SR, return_tensors="pt", padding=False)
         input_values = inputs.input_values.squeeze(0)
 
         return {
@@ -129,51 +250,104 @@ class DepressionAudioDataset(torch.utils.data.Dataset):
         }
 
     def _apply_augmentation(self, audio: np.ndarray) -> np.ndarray:
-        """Apply fast augmentation: Gaussian noise + gain + time masking."""
-        # 1. Gaussian noise with random intensity
-        noise_level = np.random.uniform(0.003, 0.008)
-        noise = np.random.normal(0, noise_level, size=audio.shape)
-        audio = audio + noise
+        """Gentler augmentation — v10: reduced intensity."""
+        # 1. Light Gaussian noise (reduced from 0.003-0.008)
+        noise_level = np.random.uniform(0.001, 0.005)
+        audio = audio + np.random.normal(0, noise_level, size=audio.shape)
 
-        # 2. Random gain variation (±3 dB)
-        gain_db = np.random.uniform(-3.0, 3.0)
-        gain = 10.0 ** (gain_db / 20.0)
+        # 2. Random gain (±2 dB, reduced from ±3 dB)
+        gain = 10.0 ** (np.random.uniform(-2.0, 2.0) / 20.0)
         audio = audio * gain
 
-        # 3. Random time masking (1-3 small segments)
-        n_masks = np.random.randint(1, 4)
-        for _ in range(n_masks):
-            mask_len = np.random.randint(SR // 10, SR // 2)  # 0.1s to 0.5s
+        # 3. Time masking (1-2 masks, shorter duration)
+        for _ in range(np.random.randint(1, 3)):
+            mask_len = np.random.randint(SR // 10, SR // 4)  # 0.1-0.25s (was 0.1-0.5s)
             mask_start = np.random.randint(0, max(1, len(audio) - mask_len))
             audio[mask_start:mask_start + mask_len] = 0.0
 
+        # 4. Time shift (new — subtle circular shift ±0.2s)
+        if np.random.random() < 0.5:
+            shift = np.random.randint(-SR // 5, SR // 5)
+            audio = np.roll(audio, shift)
+
+        # 5. SpecAugment: frequency masking (30% prob, reduced from 50%)
+        if np.random.random() < 0.3:
+            audio = self._frequency_mask(audio)
+
         return audio.astype(np.float32)
 
+    def _frequency_mask(self, audio: np.ndarray, num_masks: int = 1) -> np.ndarray:
+        """SpecAugment-style frequency masking via FFT."""
+        fft = np.fft.rfft(audio)
+        freqs = np.fft.rfftfreq(len(audio), 1.0 / SR)
 
-# ── Custom Data Collator ─────────────────────────────────────
+        for _ in range(num_masks):
+            center = np.random.uniform(100, 4000)
+            width = np.random.uniform(50, 300)
+            band = (freqs > center - width / 2) & (freqs < center + width / 2)
+            fft[band] = 0.0
+
+        return np.fft.irfft(fft, n=len(audio)).astype(np.float32)
+
+
+# ── Collator with Mixup ──────────────────────────────────────
 
 @dataclass
-class AudioDataCollator:
-    """Simple collator — samples are already padded to fixed length."""
+class MixupCollator:
+    """Collator that applies Mixup regularization during training.
+
+    Mixup blends pairs of samples: x' = λx_i + (1-λ)x_j
+    Labels become soft: y' = λy_i + (1-λ)y_j
+    This smooths the decision boundary and prevents class flipping.
+    """
+    mixup_alpha: float = 0.2
+    apply_mixup: bool = True
+    num_classes: int = 2
 
     def __call__(self, features):
         input_values = torch.stack([f["input_values"] for f in features])
         labels = torch.stack([f["labels"] for f in features])
-        return {"input_values": input_values, "labels": labels}
+
+        if self.apply_mixup and self.mixup_alpha > 0:
+            batch_size = input_values.size(0)
+            lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+            lam = max(lam, 1.0 - lam)  # Ensure λ ≥ 0.5 (original sample dominates)
+
+            # Random permutation for pairing
+            indices = torch.randperm(batch_size)
+
+            # Mix inputs
+            input_values = lam * input_values + (1.0 - lam) * input_values[indices]
+
+            # Convert labels to soft targets for Mixup
+            labels_onehot = F.one_hot(labels, self.num_classes).float()
+            labels_perm = F.one_hot(labels[indices], self.num_classes).float()
+            soft_labels = lam * labels_onehot + (1.0 - lam) * labels_perm
+
+            return {
+                "input_values": input_values,
+                "labels": soft_labels,  # Soft labels [B, num_classes]
+            }
+
+        return {
+            "input_values": input_values,
+            "labels": labels,
+        }
 
 
 # ── Metrics ───────────────────────────────────────────────────
 
 def compute_metrics(eval_pred):
-    """Compute balanced accuracy, accuracy, F1, and per-class accuracy."""
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
 
-    # Per-class accuracy for debugging bias
-    class_0_mask = labels == 0
-    class_1_mask = labels == 1
-    acc_0 = accuracy_score(labels[class_0_mask], preds[class_0_mask]) if class_0_mask.sum() > 0 else 0.0
-    acc_1 = accuracy_score(labels[class_1_mask], preds[class_1_mask]) if class_1_mask.sum() > 0 else 0.0
+    # Handle soft labels from Mixup (convert back to hard for metrics)
+    if labels.ndim > 1:
+        labels = np.argmax(labels, axis=-1)
+
+    c0, c1 = labels == 0, labels == 1
+    acc_0 = accuracy_score(labels[c0], preds[c0]) if c0.sum() > 0 else 0.0
+    acc_1 = accuracy_score(labels[c1], preds[c1]) if c1.sum() > 0 else 0.0
 
     return {
         "balanced_accuracy": balanced_accuracy_score(labels, preds),
@@ -184,152 +358,283 @@ def compute_metrics(eval_pred):
     }
 
 
-# ── Custom Trainer with class-weighted loss + label smoothing ─
+# ══════════════════════════════════════════════════════════════
+# Trainer with Focal Loss + Layer-wise LR + Mixup support
+# ══════════════════════════════════════════════════════════════
 
-class WeightedTrainer(Trainer):
-    """Trainer subclass with class-weighted CrossEntropyLoss and label smoothing."""
+class V10Trainer(Trainer):
+    """Custom Trainer with:
+    - Focal Loss (replaces weighted CE)
+    - Layer-wise learning rate decay (proper param groups)
+    - Mixup-compatible loss (handles soft labels)
+    """
 
-    def __init__(self, class_weights=None, label_smoothing=0.0, *args, **kwargs):
+    def __init__(self, focal_alpha=None, focal_gamma=2.0,
+                 label_smoothing=0.05, eval_collator=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if class_weights is not None:
-            self.class_weights = class_weights.to(self.args.device)
-        else:
-            self.class_weights = None
-        self.label_smoothing = label_smoothing
+        self.eval_collator = eval_collator
+        self.focal_loss = FocalLoss(
+            alpha=focal_alpha,
+            gamma=focal_gamma,
+            label_smoothing=label_smoothing,
+        )
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        """Use plain collator (no Mixup) for evaluation."""
+        if self.eval_collator is not None:
+            original_collator = self.data_collator
+            self.data_collator = self.eval_collator
+            dataloader = super().get_eval_dataloader(eval_dataset)
+            self.data_collator = original_collator
+            return dataloader
+        return super().get_eval_dataloader(eval_dataset)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.logits
 
-        loss_fn = nn.CrossEntropyLoss(
-            weight=self.class_weights.to(logits.device) if self.class_weights is not None else None,
-            label_smoothing=self.label_smoothing,
-        )
+        # Handle soft labels (from Mixup) vs hard labels
+        if labels.ndim > 1:
+            # Soft labels → use KL divergence-style loss
+            log_probs = F.log_softmax(logits, dim=-1)
+            loss = -(labels * log_probs).sum(dim=-1).mean()
+        else:
+            # Hard labels → use Focal Loss
+            loss = self.focal_loss(logits, labels)
 
-        loss = loss_fn(logits, labels)
         return (loss, outputs) if return_outputs else loss
 
+    def create_optimizer(self):
+        """Create optimizer with layer-wise learning rate decay.
 
-# ── Model Setup with LoRA ─────────────────────────────────────
+        Groups:
+          - Layers 0-7 (LoRA adapters): base_lr * decay^3
+          - Layers 8-11 (unfrozen):     base_lr * decay^1
+          - Classifier head (new):       base_lr (full LR)
+        """
+        model = self.model
+        base_lr = self.args.learning_rate
+        decay = LR_DECAY_FACTOR
+        wd = self.args.weight_decay
 
-def build_model():
-    """Load WavLM with LoRA adapters for parameter-efficient fine-tuning."""
-    config = WavLMConfig.from_pretrained(
-        MODEL_NAME,
-        num_labels=2,
-        problem_type="single_label_classification",
-        hidden_dropout=0.1,      # Lower dropout since LoRA is already regularizing
-        final_dropout=0.1,
-        layerdrop=0.0,           # Disable layerdrop — LoRA handles regularization
-        attention_dropout=0.05,
-    )
+        no_decay = {"bias", "LayerNorm.weight", "LayerNorm.bias",
+                     "layer_norm.weight", "layer_norm.bias"}
 
-    model = WavLMForSequenceClassification.from_pretrained(
-        MODEL_NAME,
-        config=config,
-        ignore_mismatched_sizes=True,
-    )
+        param_groups = []
 
-    # ── Enable Gradient Checkpointing (saves VRAM) ──
-    model.gradient_checkpointing_enable()
+        # Categorize all trainable parameters
+        lower_params = {"decay": [], "no_decay": []}      # Layers 0-7 (LoRA)
+        upper_params = {"decay": [], "no_decay": []}      # Layers 8-11 (unfrozen)
+        head_params = {"decay": [], "no_decay": []}        # Classifier + pooling
+        other_params = {"decay": [], "no_decay": []}       # Feature extractor norms etc.
 
-    # ── Apply LoRA ──
-    # Target the attention projection layers in all transformer layers
-    # LoRA freezes the entire base model and adds small trainable matrices
-    lora_config = LoraConfig(
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Determine which group this parameter belongs to
+            is_no_decay = any(nd in name for nd in no_decay)
+            group_key = "no_decay" if is_no_decay else "decay"
+
+            # Classify by layer position
+            if any(f"layers.{i}." in name for i in range(0, 8)):
+                lower_params[group_key].append(param)
+            elif any(f"layers.{i}." in name for i in range(8, 12)):
+                upper_params[group_key].append(param)
+            elif any(kw in name for kw in ["attn_pool", "cls_proj", "cls_norm",
+                                            "cls_out", "cls_drop", "classifier",
+                                            "projector"]):
+                head_params[group_key].append(param)
+            else:
+                other_params[group_key].append(param)
+
+        # Build param groups with appropriate LRs
+        groups_config = [
+            ("lower_layers (LoRA)", lower_params, base_lr * decay ** 3),
+            ("upper_layers (unfrozen)", upper_params, base_lr * decay ** 1),
+            ("classifier_head", head_params, base_lr),
+            ("other", other_params, base_lr * decay ** 2),
+        ]
+
+        for name, params, lr in groups_config:
+            if params["decay"]:
+                param_groups.append({
+                    "params": params["decay"],
+                    "lr": lr,
+                    "weight_decay": wd,
+                })
+            if params["no_decay"]:
+                param_groups.append({
+                    "params": params["no_decay"],
+                    "lr": lr,
+                    "weight_decay": 0.0,
+                })
+
+        # Print group info
+        print("\n  ── Optimizer Parameter Groups ──")
+        for name, params, lr in groups_config:
+            n_params = sum(p.numel() for p in params["decay"] + params["no_decay"])
+            if n_params > 0:
+                print(f"    {name}: {n_params:,} params, lr={lr:.2e}")
+
+        self.optimizer = torch.optim.AdamW(param_groups)
+        return self.optimizer
+
+
+# ══════════════════════════════════════════════════════════════
+# LoRA Config (only for frozen lower layers 0-7)
+# ══════════════════════════════════════════════════════════════
+
+def build_lora_config():
+    """LoRA on layers 0-7 only (layers 8-11 are fully unfrozen)."""
+    # Target only layers 0-7 for LoRA
+    target_modules = []
+    for i in range(0, 8):
+        target_modules.append(f"wavlm.encoder.layers.{i}.attention.q_proj")
+        target_modules.append(f"wavlm.encoder.layers.{i}.attention.v_proj")
+
+    return LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
-        target_modules=["q_proj", "v_proj"],  # Attention query and value projections
-        modules_to_save=["classifier", "projector"],  # Keep classification head fully trainable
+        target_modules=target_modules,
+        modules_to_save=["attn_pool", "cls_proj", "cls_norm", "cls_out"],
         bias="none",
     )
 
-    model = get_peft_model(model, lora_config)
 
-    # Report trainable params
-    model.print_trainable_parameters()
+# ── Leakage Check ─────────────────────────────────────────────
 
-    return model
-
-
-# ── Participant Leakage Check ─────────────────────────────────
-
-def check_participant_leakage(train_df: pd.DataFrame, val_df: pd.DataFrame):
-    """Verify no participant appears in both train and val sets."""
+def check_participant_leakage(train_df, val_df):
     train_pids = set(train_df["participant_id"].unique())
     val_pids = set(val_df["participant_id"].unique())
     overlap = train_pids & val_pids
-
     if overlap:
-        print(f"\n  ⛔ LEAKAGE DETECTED! {len(overlap)} participants in BOTH splits:")
-        for pid in sorted(overlap):
-            print(f"      - {pid}")
-        raise ValueError(
-            f"Participant leakage: {overlap}. "
-            "Fix master_metadata.csv so each participant is in only one split."
+        raise ValueError(f"Participant leakage: {overlap}")
+    print(f"\n  ✓ No leakage (train={len(train_pids)}, val={len(val_pids)} participants)")
+
+
+# ══════════════════════════════════════════════════════════════
+# Freeze / Unfreeze Strategy
+# ══════════════════════════════════════════════════════════════
+
+def configure_freezing(model):
+    """Freeze layers 0-7 (use LoRA), unfreeze layers 8-11 fully."""
+    # First freeze everything in the WavLM encoder
+    for name, param in model.named_parameters():
+        if "wavlm" in name:
+            param.requires_grad = False
+
+    # Unfreeze layers 8-11
+    for name, param in model.named_parameters():
+        if any(f"wavlm.encoder.layers.{i}." in name for i in range(8, 12)):
+            param.requires_grad = True
+
+    # Unfreeze the feature projection and layer norm (needed for adaptation)
+    for name, param in model.named_parameters():
+        if "wavlm.encoder.layer_norm" in name or "wavlm.feature_projection" in name:
+            param.requires_grad = True
+
+    # Count trainable
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n  Freeze strategy: {trainable:,} / {total:,} params trainable ({100*trainable/total:.1f}%)")
+
+    # Detailed breakdown
+    frozen_layers = 0
+    unfrozen_layers = 0
+    for i in range(12):
+        layer_params = sum(
+            p.numel() for n, p in model.named_parameters()
+            if f"layers.{i}." in n
         )
-    else:
-        print(f"\n  ✓ No participant leakage (train={len(train_pids)}, val={len(val_pids)} unique participants)")
+        layer_trainable = sum(
+            p.numel() for n, p in model.named_parameters()
+            if f"layers.{i}." in n and p.requires_grad
+        )
+        status = "UNFROZEN" if layer_trainable > 0 else "frozen"
+        if layer_trainable > 0:
+            unfrozen_layers += 1
+        else:
+            frozen_layers += 1
+        print(f"    Layer {i:2d}: {status:>8} ({layer_trainable:>8,} / {layer_params:>8,})")
 
 
 # ── Main ──────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
-    print("  Depression Detection Pipeline v8 — WavLM + LoRA")
+    print("  Depression Detection v10 — WavLM + AttentionPool + Focal")
     print("=" * 60)
 
-    # Check GPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         print(f"\n  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     else:
-        print("\n  ⚠  No GPU detected — training will be very slow!")
+        print("\n  ⚠  No GPU — training will be very slow!")
 
     # Load metadata
     df = pd.read_csv(METADATA_CSV)
     train_df = df[df["split"] == "train"].copy()
     val_df = df[df["split"] == "val"].copy()
-
-    # Check for participant leakage before training
     check_participant_leakage(train_df, val_df)
 
-    n_train_0 = int((train_df["label"] == 0).sum())
-    n_train_1 = int((train_df["label"] == 1).sum())
-    n_val_0 = int((val_df["label"] == 0).sum())
-    n_val_1 = int((val_df["label"] == 1).sum())
+    n0 = int((train_df["label"] == 0).sum())
+    n1 = int((train_df["label"] == 1).sum())
+    print(f"\n  Train: {len(train_df)} chunks (healthy={n0}, depressed={n1})")
+    print(f"  Val:   {len(val_df)} chunks")
 
-    print(f"\n  Train: {len(train_df)} chunks (healthy={n_train_0}, depressed={n_train_1})")
-    print(f"  Val:   {len(val_df)} chunks (healthy={n_val_0}, depressed={n_val_1})")
+    # Focal Loss alpha (class weights)
+    total = n0 + n1
+    w0 = total / (2.0 * n0) if n0 > 0 else 1.0
+    w1 = total / (2.0 * n1) if n1 > 0 else 1.0
+    focal_alpha = torch.tensor([w0, w1], dtype=torch.float32)
+    print(f"  Focal α: healthy={w0:.3f}, depressed={w1:.3f}")
 
-    # Compute class weights from training set chunk distribution
-    total_train = n_train_0 + n_train_1
-    weight_0 = total_train / (2.0 * n_train_0) if n_train_0 > 0 else 1.0
-    weight_1 = total_train / (2.0 * n_train_1) if n_train_1 > 0 else 1.0
-    class_weights = torch.tensor([weight_0, weight_1], dtype=torch.float32)
-    print(f"\n  Class weights: healthy={weight_0:.3f}, depressed={weight_1:.3f}")
-
-    # Build datasets
+    # Datasets
     train_dataset = DepressionAudioDataset(train_df, augment=True)
     val_dataset = DepressionAudioDataset(val_df, augment=False)
 
-    # Build model with LoRA
-    model = build_model()
+    # Build model with attention pooling
+    config = WavLMConfig.from_pretrained(
+        MODEL_NAME,
+        num_labels=2,
+        problem_type="single_label_classification",
+        hidden_dropout=0.1,
+        final_dropout=0.15,
+        layerdrop=0.0,
+        attention_dropout=0.05,
+    )
+
+    model = WavLMAttentionPool.from_pretrained(
+        MODEL_NAME, config=config, ignore_mismatched_sizes=True,
+    )
+
+    # Enable gradient checkpointing
+    model.gradient_checkpointing_enable()
+
+    # Freeze lower layers, unfreeze top 4
+    configure_freezing(model)
+
+    # Apply LoRA on frozen lower layers only
+    lora_config = build_lora_config()
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
 
     # Training arguments
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
-        num_train_epochs=30,
-        per_device_train_batch_size=8,      # Can increase with LoRA + grad checkpoint!
+        num_train_epochs=40,
+        per_device_train_batch_size=8,
         per_device_eval_batch_size=16,
-        gradient_accumulation_steps=2,       # Effective batch = 16
-        learning_rate=3e-4,                  # LoRA uses higher LR than full fine-tuning
-        lr_scheduler_type="cosine",
-        warmup_steps=200,                    # LoRA needs less warmup
-        weight_decay=0.01,
+        gradient_accumulation_steps=4,       # Effective batch = 32
+        learning_rate=BASE_LR,
+        lr_scheduler_type="cosine_with_restarts",
+        warmup_ratio=0.1,                    # 10% warmup
+        weight_decay=0.05,
+        max_grad_norm=1.0,                   # Gradient clipping
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_strategy="epoch",
@@ -338,54 +643,56 @@ def main():
         greater_is_better=True,
         save_total_limit=3,
         fp16=torch.cuda.is_available(),
-        dataloader_num_workers=0,            # 0 for Windows compatibility
+        dataloader_num_workers=0,
         seed=SEED,
         report_to="none",
         remove_unused_columns=False,
     )
 
-    # Use custom WeightedTrainer with label smoothing
-    trainer = WeightedTrainer(
-        class_weights=class_weights,
-        label_smoothing=0.1,
+    # Collators: Mixup for training, plain for eval
+    train_collator = MixupCollator(mixup_alpha=MIXUP_ALPHA, apply_mixup=True)
+    eval_collator = MixupCollator(mixup_alpha=0.0, apply_mixup=False)
+
+    trainer = V10Trainer(
+        focal_alpha=focal_alpha,
+        focal_gamma=2.0,
+        label_smoothing=0.05,
+        eval_collator=eval_collator,
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=AudioDataCollator(),
+        data_collator=train_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=7)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=10)],
     )
 
     # Train
-    print(f"\n  Model: {MODEL_NAME}")
-    print(f"  LoRA: rank={LORA_RANK}, alpha={LORA_ALPHA}, dropout={LORA_DROPOUT}")
-    print(f"  Label smoothing: 0.1")
-    print("  Features: LoRA ✓ | grad_ckpt ✓ | norm ✓ | weights ✓ | augment ✓ | smoothing ✓")
+    print(f"\n  Model: {MODEL_NAME} + AttentionPool + LoRA + Focal")
+    print(f"  LR: {BASE_LR:.1e}, decay={LR_DECAY_FACTOR}, scheduler=cosine_with_restarts")
+    print(f"  Focal Loss: γ=2.0, label_smoothing=0.05")
+    print(f"  Mixup: α={MIXUP_ALPHA}")
+    print(f"  Grad clip: max_norm=1.0")
     print("─" * 60)
-    trainer.train()
+    trainer.train(resume_from_checkpoint=True if any(OUTPUT_DIR.glob("checkpoint-*")) else None)
 
-    # ── Save: merge LoRA weights into base model for easy inference ──
-    print("\n  Merging LoRA adapters into base model...")
+    # Merge LoRA and save full model
+    print("\n  Merging LoRA adapters...")
     merged_model = model.merge_and_unload()
-    save_path = str(OUTPUT_DIR / "best_model_merged")
+    save_path = str(OUTPUT_DIR / "best_model")
     merged_model.save_pretrained(save_path)
     feature_extractor.save_pretrained(save_path)
-    print(f"  Merged model saved to: {save_path}")
+    print(f"  Model saved to: {save_path}")
 
     # Final evaluation
-    print("\n  ── Final Evaluation on Validation Set ──")
+    print("\n  ── Final Evaluation ──")
     metrics = trainer.evaluate()
     for k, v in sorted(metrics.items()):
-        if isinstance(v, float):
-            print(f"    {k}: {v:.4f}")
-        else:
-            print(f"    {k}: {v}")
+        print(f"    {k}: {v:.4f}" if isinstance(v, float) else f"    {k}: {v}")
 
-    # Save training logs
-    log_df = pd.DataFrame(trainer.state.log_history)
-    log_df.to_csv(OUTPUT_DIR / "training_log.csv", index=False)
-    print(f"\n  Training log saved to: {OUTPUT_DIR / 'training_log.csv'}")
+    # Save logs
+    pd.DataFrame(trainer.state.log_history).to_csv(OUTPUT_DIR / "training_log.csv", index=False)
+    print(f"  Log saved to: {OUTPUT_DIR / 'training_log.csv'}")
     print("=" * 60)
 
 
