@@ -1,16 +1,13 @@
-# Model weights & checkpoints (too large for GitHub)
+# Training checkpoints (large, regeneratable)
 wavlm_lora_v8/
 wavlm_lora_v9/
-wavlm_lora_v10/
+wavlm_lora_v10/checkpoint-*/
+wavlm_lora_v10/runs/
 
 # Audio data (not redistributable)
 audio_lanzhou_2015/
 DiacWoz/
 refined_data/
-
-# Generated data
-master_metadata.csv
-*.csv
 
 # Python cache
 __pycache__/
