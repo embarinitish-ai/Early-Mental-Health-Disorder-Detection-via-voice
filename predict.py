@@ -1,51 +1,60 @@
 """
-predict.py — Participant-Level Depression Prediction
+predict.py — Deployment-Ready Depression Detection from Voice
 
-Loads the trained WavLM + AttentionPool model (v10) and makes per-participant
-predictions by aggregating chunk-level probabilities with majority voting.
-
-This is the "80% barrier breaker" — noisy per-chunk predictions become
-stable per-person predictions through probability averaging.
+Takes a single raw audio file (any length), automatically:
+  1. Loads & resamples to 16 kHz mono
+  2. Strips silence from edges
+  3. Splits into 10-second chunks with 2-second overlap
+  4. Runs each chunk through the trained WavLM + AttentionPool model
+  5. Pools chunk-level probabilities (mean + confidence weighting)
+  6. Outputs final diagnosis: Depressed / Not Depressed
 
 Usage:
-    python predict.py                          # Default threshold 0.4
-    python predict.py --threshold 0.35         # Custom threshold
-    python predict.py --model_path path/to/model
+    python predict.py --audio path/to/voice.wav
+    python predict.py --audio path/to/voice.mp3 --threshold 0.45
+    python predict.py --audio path/to/voice.wav --model_path path/to/model
+    python predict.py --audio path/to/voice.wav --verbose
 """
 
 import argparse
+import sys
+import time
 import numpy as np
-import pandas as pd
 import torch
 import torchaudio
 from pathlib import Path
-
-from sklearn.metrics import (
-    balanced_accuracy_score,
-    accuracy_score,
-    f1_score,
-    classification_report,
-    confusion_matrix,
-)
-from transformers import (
-    WavLMForSequenceClassification,
-    WavLMConfig,
-    Wav2Vec2FeatureExtractor,
-)
-from transformers.modeling_outputs import SequenceClassifierOutput
 from torch import nn
 import torch.nn.functional as F
 
-# ── Configuration ──────────────────────────────────────────────
-BASE_DIR = Path(r"C:\Users\embar\OneDrive\Desktop\nir")
-METADATA_CSV = BASE_DIR / "master_metadata.csv"
+from transformers import (
+    WavLMForSequenceClassification,
+    Wav2Vec2FeatureExtractor,
+)
+from transformers.modeling_outputs import SequenceClassifierOutput
+
+
+# ══════════════════════════════════════════════════════════════
+# Configuration
+# ══════════════════════════════════════════════════════════════
+
+BASE_DIR = Path(r"C:\Users\embar\OneDrive-N\Desktop\nir")
 DEFAULT_MODEL_PATH = BASE_DIR / "wavlm_lora_v10" / "best_model"
 
-SR = 16_000
-MAX_LENGTH = SR * 10
+SR = 16_000                   # Model sample rate
+CHUNK_SECONDS = 10            # Each chunk is 10 seconds
+CHUNK_LENGTH = SR * CHUNK_SECONDS   # 160,000 samples
+OVERLAP_SECONDS = 2           # 2-second overlap between chunks
+OVERLAP_LENGTH = SR * OVERLAP_SECONDS
+STRIDE = CHUNK_LENGTH - OVERLAP_LENGTH  # Step size = 8 seconds
+
+# Silence stripping
+SILENCE_THRESHOLD_DB = -40    # dBFS threshold for silence
+MIN_AUDIO_SECONDS = 3         # Minimum audio length after silence strip
 
 
-# ── Custom Model (must match train.py v10 definition) ─────────
+# ══════════════════════════════════════════════════════════════
+# Model Architecture (must match train.py v10)
+# ══════════════════════════════════════════════════════════════
 
 class AttentionPooling(nn.Module):
     """Multi-head attention pooling over temporal dimension."""
@@ -106,182 +115,374 @@ class WavLMAttentionPool(WavLMForSequenceClassification):
         return SequenceClassifierOutput(logits=logits)
 
 
-# ── Audio Processing ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Audio Loading & Preprocessing
+# ══════════════════════════════════════════════════════════════
 
-def load_and_process_audio(file_path, feature_extractor):
-    """Load audio, normalize, and prepare for model input."""
-    waveform, sample_rate = torchaudio.load(file_path)
+def load_audio(file_path: str) -> np.ndarray:
+    """
+    Load any audio file, convert to 16 kHz mono, and return as numpy array.
+    Supports: .wav, .mp3, .flac, .ogg, .m4a, etc.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Audio file not found: {file_path}")
 
+    waveform, sample_rate = torchaudio.load(str(path))
+
+    # Resample if needed
     if sample_rate != SR:
         waveform = torchaudio.transforms.Resample(sample_rate, SR)(waveform)
+
+    # Convert to mono
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
 
     audio = waveform.squeeze(0).numpy()
-
-    # Instance normalization (same as training)
-    clip_std = np.std(audio)
-    if clip_std > 1e-8:
-        audio = (audio - np.mean(audio)) / clip_std
-
-    # Pad or truncate
-    if len(audio) > MAX_LENGTH:
-        audio = audio[:MAX_LENGTH]
-    elif len(audio) < MAX_LENGTH:
-        audio = np.pad(audio, (0, MAX_LENGTH - len(audio)), mode="constant")
-
-    # Feature extractor normalization
-    inputs = feature_extractor(audio, sampling_rate=SR, return_tensors="pt", padding=False)
-    return inputs.input_values  # [1, seq_len]
+    return audio
 
 
-# ── Prediction ────────────────────────────────────────────────
+def strip_silence(audio: np.ndarray, threshold_db: float = SILENCE_THRESHOLD_DB) -> np.ndarray:
+    """
+    Remove leading and trailing silence from audio.
+    Uses a simple energy-based approach with a sliding window.
+    """
+    # Convert threshold from dB to amplitude
+    threshold_amp = 10 ** (threshold_db / 20.0)
+
+    # Use a small window to detect silence
+    window_size = int(SR * 0.05)  # 50ms window
+    energy = np.array([
+        np.sqrt(np.mean(audio[i:i + window_size] ** 2))
+        for i in range(0, len(audio) - window_size, window_size)
+    ])
+
+    # Find first and last non-silent frames
+    active = energy > threshold_amp
+    if not np.any(active):
+        return audio  # All silence — return as-is, model will handle it
+
+    first_active = np.argmax(active) * window_size
+    last_active = (len(active) - 1 - np.argmax(active[::-1])) * window_size + window_size
+
+    # Add a small buffer (200ms) on each side
+    buffer = int(SR * 0.2)
+    start = max(0, first_active - buffer)
+    end = min(len(audio), last_active + buffer)
+
+    return audio[start:end]
+
+
+def normalize_audio(audio: np.ndarray) -> np.ndarray:
+    """Instance normalization (zero-mean, unit-variance) — same as training."""
+    std = np.std(audio)
+    if std > 1e-8:
+        audio = (audio - np.mean(audio)) / std
+    return audio
+
+
+def chunk_audio(audio: np.ndarray) -> list[np.ndarray]:
+    """
+    Split audio into overlapping chunks of CHUNK_LENGTH samples.
+
+    - Stride = CHUNK_LENGTH - OVERLAP_LENGTH (8 seconds)
+    - Last chunk is zero-padded if shorter than CHUNK_LENGTH
+    - Very short audio (< 3s) is padded to a single chunk
+
+    Returns a list of numpy arrays, each of length CHUNK_LENGTH.
+    """
+    total_samples = len(audio)
+
+    # If audio is very short, pad to one full chunk
+    if total_samples < CHUNK_LENGTH:
+        padded = np.pad(audio, (0, CHUNK_LENGTH - total_samples), mode="constant")
+        return [padded]
+
+    chunks = []
+    start = 0
+    while start < total_samples:
+        end = start + CHUNK_LENGTH
+        chunk = audio[start:end]
+
+        # Pad last chunk if needed
+        if len(chunk) < CHUNK_LENGTH:
+            chunk = np.pad(chunk, (0, CHUNK_LENGTH - len(chunk)), mode="constant")
+
+        chunks.append(chunk)
+        start += STRIDE
+
+        # If this chunk already reached the end, stop
+        if end >= total_samples:
+            break
+
+    return chunks
+
+
+# ══════════════════════════════════════════════════════════════
+# Inference Engine
+# ══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def predict_chunks(model, chunk_paths, feature_extractor, device):
-    """Get softmax probabilities for a list of audio chunk paths."""
-    all_probs = []
+def predict_single_chunk(model, chunk: np.ndarray, feature_extractor, device) -> np.ndarray:
+    """Run inference on a single audio chunk, returns softmax probabilities [P(healthy), P(depressed)]."""
+    inputs = feature_extractor(chunk, sampling_rate=SR, return_tensors="pt", padding=False)
+    input_values = inputs.input_values.to(device)
 
-    for path in chunk_paths:
-        try:
-            input_values = load_and_process_audio(path, feature_extractor).to(device)
-            outputs = model(input_values)
-            probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()[0]
-            all_probs.append(probs)
-        except Exception as e:
-            print(f"    ⚠ Skipped {Path(path).name}: {e}")
-
-    return np.array(all_probs)  # [n_chunks, 2]
+    outputs = model(input_values)
+    probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()[0]
+    return probs
 
 
-def participant_vote(chunk_probs, threshold=0.4):
-    """Aggregate chunk probabilities into a participant-level decision.
+def pool_predictions(chunk_probs: np.ndarray, threshold: float = 0.4) -> dict:
+    """
+    Aggregate chunk-level probabilities into a final participant decision.
+
+    Strategies combined:
+      1. Mean pooling — average P(depressed) across all chunks
+      2. Confidence-weighted mean — weight by how confident each chunk is
 
     Args:
         chunk_probs: [n_chunks, 2] array of softmax probabilities
-        threshold: if avg. P(depressed) > threshold → predict depressed
+        threshold: decision boundary (default 0.4, lower = higher recall)
 
     Returns:
-        prediction (0 or 1), avg_prob_depressed, confidence
+        dict with prediction details
     """
-    if len(chunk_probs) == 0:
-        return 0, 0.0, 0.0
+    n_chunks = len(chunk_probs)
 
-    avg_probs = chunk_probs.mean(axis=0)  # Average across all chunks
-    prob_depressed = avg_probs[1]
+    if n_chunks == 0:
+        return {
+            "prediction": 0,
+            "label": "Not Depressed",
+            "probability": 0.0,
+            "confidence": 0.0,
+            "n_chunks": 0,
+            "method": "no_data",
+        }
 
-    prediction = 1 if prob_depressed > threshold else 0
-    confidence = max(avg_probs)
+    # ── Mean pooling ──
+    mean_probs = chunk_probs.mean(axis=0)
+    mean_prob_depressed = mean_probs[1]
 
-    return prediction, prob_depressed, confidence
+    # ── Confidence-weighted pooling ──
+    # Weight each chunk by how confident it is (max of its two probs)
+    confidences = np.max(chunk_probs, axis=1)  # [n_chunks]
+    weighted_probs = (chunk_probs.T * confidences).T  # weight each row
+    weighted_mean = weighted_probs.sum(axis=0) / confidences.sum()
+    weighted_prob_depressed = weighted_mean[1]
+
+    # ── Combine: average of mean and confidence-weighted ──
+    final_prob = 0.5 * mean_prob_depressed + 0.5 * weighted_prob_depressed
+
+    # ── Decision ──
+    prediction = 1 if final_prob > threshold else 0
+    label = "Depressed" if prediction == 1 else "Not Depressed"
+
+    # Overall confidence: how far from the threshold
+    confidence = abs(final_prob - threshold) / max(threshold, 1 - threshold)
+
+    return {
+        "prediction": prediction,
+        "label": label,
+        "probability": float(final_prob),
+        "mean_prob": float(mean_prob_depressed),
+        "weighted_prob": float(weighted_prob_depressed),
+        "confidence": float(min(confidence, 1.0)),
+        "n_chunks": n_chunks,
+        "chunk_probs": chunk_probs[:, 1].tolist(),  # Per-chunk P(depressed)
+    }
 
 
-# ── Main ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Main Pipeline
+# ══════════════════════════════════════════════════════════════
 
-def main():
-    parser = argparse.ArgumentParser(description="Participant-level depression prediction")
-    parser.add_argument("--model_path", type=str, default=str(DEFAULT_MODEL_PATH),
-                        help="Path to saved model directory")
-    parser.add_argument("--threshold", type=float, default=0.4,
-                        help="Depression threshold (default: 0.4, lower = higher recall)")
-    parser.add_argument("--split", type=str, default="val",
-                        help="Which split to evaluate: 'val' or 'train'")
-    args = parser.parse_args()
+def run_prediction(audio_path: str, model_path: str = None, threshold: float = 0.4, verbose: bool = False):
+    """
+    Full prediction pipeline: audio file → depression prediction.
 
-    print("=" * 60)
-    print("  Participant-Level Depression Prediction")
-    print("=" * 60)
+    Args:
+        audio_path: path to a single audio file (any format)
+        model_path: path to the saved model directory
+        threshold: decision threshold (default 0.4)
+        verbose: print detailed per-chunk info
 
+    Returns:
+        dict with prediction results
+    """
+    model_path = model_path or str(DEFAULT_MODEL_PATH)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\n  Device: {device}")
-    print(f"  Model:  {args.model_path}")
-    print(f"  Threshold: {args.threshold}")
 
-    # Load model
-    print("\n  Loading model...")
-    model = WavLMAttentionPool.from_pretrained(args.model_path)
+    # ── Step 1: Load Model ──
+    print("\n" + "═" * 60)
+    print("  🧠 Depression Detection — Voice Analysis")
+    print("═" * 60)
+    print(f"\n  📁 Audio:     {audio_path}")
+    print(f"  🔧 Device:    {device}")
+    print(f"  📊 Threshold: {threshold}")
+
+    t0 = time.time()
+    print("\n  ⏳ Loading model...", end=" ", flush=True)
+    model = WavLMAttentionPool.from_pretrained(model_path)
     model = model.to(device)
     model.eval()
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_path)
+    print(f"done ({time.time() - t0:.1f}s)")
 
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(args.model_path)
+    # ── Step 2: Load & Preprocess Audio ──
+    print("  ⏳ Loading audio...", end=" ", flush=True)
+    t1 = time.time()
+    raw_audio = load_audio(audio_path)
+    raw_duration = len(raw_audio) / SR
+    print(f"done ({raw_duration:.1f}s of audio)")
 
-    # Load metadata
-    df = pd.read_csv(METADATA_CSV)
-    eval_df = df[df["split"] == args.split].copy()
-    print(f"  Evaluating {args.split} set: {len(eval_df)} chunks")
+    # Strip silence
+    audio = strip_silence(raw_audio)
+    clean_duration = len(audio) / SR
+    stripped = raw_duration - clean_duration
 
-    # Group by participant
-    participants = eval_df.groupby("participant_id")
-    print(f"  Participants: {len(participants)}")
+    if clean_duration < MIN_AUDIO_SECONDS:
+        print(f"\n  ⚠️  Audio too short after silence removal ({clean_duration:.1f}s).")
+        print(f"      Minimum required: {MIN_AUDIO_SECONDS}s. Using original audio.")
+        audio = raw_audio
+        clean_duration = raw_duration
+        stripped = 0
 
-    # ── Per-participant prediction ──
-    results = []
-    print("\n  ── Predictions ──")
-    print(f"  {'PID':<20} {'True':>6} {'Pred':>6} {'P(dep)':>8} {'Chunks':>8} {'Result':>8}")
-    print("  " + "─" * 58)
+    if stripped > 0.5:
+        print(f"  ✂️  Stripped {stripped:.1f}s of silence → {clean_duration:.1f}s clean audio")
 
-    for pid, group in participants:
-        true_label = group["label"].iloc[0]
-        chunk_paths = group["file_path"].tolist()
+    # Normalize
+    audio = normalize_audio(audio)
 
-        # Get chunk-level probabilities
-        chunk_probs = predict_chunks(model, chunk_paths, feature_extractor, device)
+    # ── Step 3: Chunk the Audio ──
+    chunks = chunk_audio(audio)
+    print(f"  🔪 Split into {len(chunks)} chunks ({CHUNK_SECONDS}s each, {OVERLAP_SECONDS}s overlap)")
 
-        # Participant-level vote
-        pred, prob_dep, conf = participant_vote(chunk_probs, threshold=args.threshold)
+    # ── Step 4: Per-Chunk Inference ──
+    print("\n  ── Analyzing Voice Patterns ──")
+    all_probs = []
 
-        result = "✓" if pred == true_label else "✗"
-        label_str = {0: "healthy", 1: "depress"}
-        print(f"  {str(pid):<20} {label_str[true_label]:>6} {label_str[pred]:>6} "
-              f"{prob_dep:>8.3f} {len(chunk_paths):>8} {result:>8}")
+    for i, chunk in enumerate(chunks):
+        t_chunk = time.time()
+        probs = predict_single_chunk(model, chunk, feature_extractor, device)
+        all_probs.append(probs)
+        elapsed = time.time() - t_chunk
 
-        results.append({
-            "participant_id": pid,
-            "true_label": true_label,
-            "predicted": pred,
-            "prob_depressed": prob_dep,
-            "n_chunks": len(chunk_paths),
-            "correct": pred == true_label,
-        })
+        # Progress indicator
+        bar_len = 20
+        filled = int((i + 1) / len(chunks) * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        status = f"  [{bar}] Chunk {i+1}/{len(chunks)}"
 
-    # ── Participant-level metrics ──
-    results_df = pd.DataFrame(results)
-    y_true = results_df["true_label"].values
-    y_pred = results_df["predicted"].values
+        if verbose:
+            p_dep = probs[1]
+            chunk_label = "⚠️  DEP" if p_dep > threshold else "✅ OK "
+            status += f"  →  P(dep)={p_dep:.3f}  {chunk_label}  ({elapsed:.2f}s)"
 
-    bal_acc = balanced_accuracy_score(y_true, y_pred)
-    acc = accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred, average="binary")
+        print(f"\r{status}", end="", flush=True)
 
-    print("\n" + "=" * 60)
-    print("  ── PARTICIPANT-LEVEL RESULTS ──")
-    print("=" * 60)
-    print(f"\n  Balanced Accuracy:  {bal_acc:.4f}  ({bal_acc*100:.1f}%)")
-    print(f"  Accuracy:           {acc:.4f}  ({acc*100:.1f}%)")
-    print(f"  F1 Score:           {f1:.4f}")
+    print()  # New line after progress bar
 
-    print(f"\n  Classification Report:")
-    print(classification_report(y_true, y_pred, target_names=["Healthy", "Depressed"], digits=4))
+    chunk_probs = np.array(all_probs)
 
-    print(f"  Confusion Matrix:")
-    cm = confusion_matrix(y_true, y_pred)
-    print(f"                  Pred Healthy  Pred Depressed")
-    print(f"    True Healthy   {cm[0][0]:>10}  {cm[0][1]:>14}")
-    print(f"    True Depressed {cm[1][0]:>10}  {cm[1][1]:>14}")
+    # ── Step 5: Pool & Decide ──
+    result = pool_predictions(chunk_probs, threshold=threshold)
 
-    # Save results
-    results_path = Path(args.model_path).parent / "participant_predictions.csv"
-    results_df.to_csv(results_path, index=False)
-    print(f"\n  Results saved to: {results_path}")
+    # ── Step 6: Display Results ──
+    total_time = time.time() - t0
 
-    # Suggest threshold tuning
-    print("\n  ── Threshold Sensitivity ──")
-    for t in [0.3, 0.35, 0.4, 0.45, 0.5]:
-        preds_t = (results_df["prob_depressed"] > t).astype(int).values
-        ba = balanced_accuracy_score(y_true, preds_t)
-        print(f"    threshold={t:.2f}  →  balanced_acc={ba:.4f}  ({ba*100:.1f}%)")
+    print("\n" + "═" * 60)
+    if result["prediction"] == 1:
+        print("  🔴 RESULT: Signs of Depression Detected")
+    else:
+        print("  🟢 RESULT: No Signs of Depression Detected")
+    print("═" * 60)
 
-    print("=" * 60)
+    print(f"\n  📊 Depression Probability:  {result['probability']:.1%}")
+    print(f"  📊 Mean (unweighted):      {result['mean_prob']:.1%}")
+    print(f"  📊 Confidence-weighted:    {result['weighted_prob']:.1%}")
+    print(f"  📊 Decision Confidence:    {result['confidence']:.1%}")
+    print(f"  📊 Threshold:              {threshold:.1%}")
+    print(f"  📊 Chunks Analyzed:        {result['n_chunks']}")
+    print(f"  ⏱️  Total Time:             {total_time:.1f}s")
+
+    if verbose and result["n_chunks"] > 0:
+        print("\n  ── Per-Chunk Breakdown ──")
+        print(f"  {'Chunk':<8} {'Time Range':<16} {'P(Depressed)':<14} {'Status':<8}")
+        print("  " + "─" * 48)
+        for i, p_dep in enumerate(result["chunk_probs"]):
+            start_sec = i * (CHUNK_SECONDS - OVERLAP_SECONDS)
+            end_sec = start_sec + CHUNK_SECONDS
+            status = "⚠️  DEP" if p_dep > threshold else "✅ OK"
+            print(f"  {i+1:<8} {start_sec:>4}s – {end_sec:<4}s   {p_dep:<14.3f} {status}")
+
+    print("\n" + "═" * 60)
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# CLI Entry Point
+# ══════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="🧠 Depression Detection from Voice — Deployment Script",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python predict.py --audio recording.wav
+  python predict.py --audio interview.mp3 --threshold 0.45
+  python predict.py --audio voice.wav --verbose
+  python predict.py --audio voice.wav --model_path ./my_model
+        """,
+    )
+    parser.add_argument(
+        "--audio", type=str, required=True,
+        help="Path to the audio file to analyze (supports .wav, .mp3, .flac, .ogg, .m4a)",
+    )
+    parser.add_argument(
+        "--model_path", type=str, default=str(DEFAULT_MODEL_PATH),
+        help=f"Path to saved model directory (default: {DEFAULT_MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=0.4,
+        help="Depression threshold (default: 0.4, lower = higher recall)",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Show detailed per-chunk predictions",
+    )
+
+    args = parser.parse_args()
+
+    # Validate audio file
+    audio_path = Path(args.audio)
+    if not audio_path.exists():
+        print(f"\n  ❌ Error: Audio file not found: {args.audio}")
+        sys.exit(1)
+
+    supported = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".wma", ".aac", ".opus"}
+    if audio_path.suffix.lower() not in supported:
+        print(f"\n  ⚠️  Warning: '{audio_path.suffix}' may not be supported.")
+        print(f"      Supported formats: {', '.join(sorted(supported))}")
+
+    # Validate model
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        print(f"\n  ❌ Error: Model not found at: {args.model_path}")
+        sys.exit(1)
+
+    # Run prediction
+    result = run_prediction(
+        audio_path=str(audio_path),
+        model_path=str(model_path),
+        threshold=args.threshold,
+        verbose=args.verbose,
+    )
+
+    # Exit code: 0 = healthy, 1 = depressed (useful for scripting)
+    sys.exit(result["prediction"])
 
 
 if __name__ == "__main__":
